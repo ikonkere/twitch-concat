@@ -1,4 +1,4 @@
-# twitch-concat
+# vget
 
 This is a fork of Arne Vogel's `concat` because i suck at golang and can't properly contribute but i use this tool daily and wanted to have features that are most useful to me.
 
