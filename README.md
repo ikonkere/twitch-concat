@@ -4,7 +4,7 @@ This is a fork of Arne Vogel's `concat` because i suck at golang and can't prope
 
 ## Prerequisite
 
-- \*nix
+- OSX
 - `brew install ffmpeg`
 - increase max open files (`ulimit -n 4096`) to at least 4096 to avoid ffmpeg issues on large VODs
 
