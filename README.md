@@ -2,6 +2,8 @@
 
 This is a fork of Arne Vogel's `concat` because i suck at golang and can't properly contribute but i use this tool daily and wanted to have features that are most useful to me.
 
+![Example](https://i.ibb.co/3yZ6q8G/Screenshot-2020-04-09-at-12-20-24.png)
+
 ## Prerequisite
 
 - OSX
