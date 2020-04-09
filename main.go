@@ -5,19 +5,21 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/abiosoft/semaphore"
+	"github.com/kr/logfmt"
+	"github.com/schollz/progressbar/v3"
 )
 
 //new style of edgecast links: https://vod089-ttvnw.akamaized.net/1059582120fbff1a392a_reinierboortman_26420932624_719978480/chunked/highlight-180380104.m3u8
@@ -35,20 +37,15 @@ const qualityStart string = `VIDEO="`
 const qualityEnd string = `"`
 const sourceQuality string = "chunked"
 const chunkFileExtension string = ".ts"
-const currentReleaseLink string = "https://github.com/ArneVogel/concat/releases/latest"
-const currentReleaseStart string = `<a href="/ArneVogel/concat/releases/download/`
-const currentReleaseEnd string = `/concat"`
-const versionNumber string = "v0.3.0"
 
 var ffmpegCMD = `ffmpeg`
 
 var debug bool
-var twitchClientID = "aokchnui2n8q38g0vezl9hq6htzy4c"
+var twitchClientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 
-var sem *semaphore.Semaphore
+var concurrentDownloads int
 
 var maxTryCount *int
-var chunkProgress = make(chan int)
 var audio *bool
 var audioOnly *bool
 
@@ -139,22 +136,18 @@ func toSeconds(sh int, sm int, ss int) int {
 	return sh*3600 + sm*60 + ss
 }
 
-func downloadChunk(newpath string, edgecastBaseURL string, chunkCount string, chunkName string, vodID string, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	sem.Acquire()
+func downloadChunk(newpath string, edgecastBaseURL string, chunkCount string, chunkName string, vodID string) int64 {
+	var chunkLength int64
 
 	chunkURL := edgecastBaseURL + chunkName
 
 	downloadPath := newpath + "/" + vodID + "_" + chunkCount + chunkFileExtension
 
-	if _, err := os.Stat(downloadPath); !os.IsNotExist(err) {
+	if fi, err := os.Stat(downloadPath); !os.IsNotExist(err) {
 		if debug {
-			fmt.Printf("Skipping %s thats already downloaded\n", chunkURL)
+			fmt.Printf("Chunk exists: %s\n", chunkURL)
 		}
-		chunkProgress <- 1
-		sem.Release()
-		return
+		return fi.Size()
 	}
 
 	if debug {
@@ -178,13 +171,14 @@ func downloadChunk(newpath string, edgecastBaseURL string, chunkCount string, ch
 
 		if err != nil {
 			printFatal(err, "Could not download chunk", chunkName)
+			return -1
 		}
 
 		if resp.StatusCode != 200 {
 			body, _ := ioutil.ReadAll(resp.Body)
 			resp.Body.Close()
 			printDebugf("StatusCode: %d; %s; Could not download chunk '%s'", resp.StatusCode, string(body), chunkURL)
-			return
+			return -1
 		}
 
 		body, err = ioutil.ReadAll(resp.Body)
@@ -194,6 +188,7 @@ func downloadChunk(newpath string, edgecastBaseURL string, chunkCount string, ch
 
 			if retryCount == *maxTryCount-1 {
 				printFatal(err, "Could not download chunk", chunkURL, "after", *maxTryCount, "tries.")
+				return -1
 			} else {
 				printDebug("Could not download chunk", chunkURL)
 				printDebug(err)
@@ -202,13 +197,12 @@ func downloadChunk(newpath string, edgecastBaseURL string, chunkCount string, ch
 		} else {
 			break
 		}
-
 	}
 
-	chunkProgress <- 1
+	chunkLength = int64(len(body))
 	_ = ioutil.WriteFile(downloadPath, body, 0644)
 
-	sem.Release()
+	return chunkLength
 }
 
 func createConcatFile(newpath string, chunkNum int, startChunk int, vodID string) (*os.File, error) {
@@ -237,7 +231,8 @@ func ffmpegCombine(newpath string, chunkNum int, startChunk int, vodID string, v
 		return
 	}
 	defer os.Remove(tempFile.Name())
-	args := []string{"-f", "concat", "-safe", "0", "-i", tempFile.Name(), "-c", "copy", "-bsf:a", "aac_adtstoasc", "-fflags", "+genpts", vodSavePath}
+
+	args := []string{"-progress", "tcp://localhost:9998", "-f", "concat", "-safe", "0", "-i", tempFile.Name(), "-c", "copy", "-bsf:a", "aac_adtstoasc", "-fflags", "+genpts", vodSavePath}
 
 	if debug {
 		fmt.Printf("Running ffmpeg: %s %s\n", ffmpegCMD, args)
@@ -274,6 +269,83 @@ func ffmpegCombine(newpath string, chunkNum int, startChunk int, vodID string, v
 			os.Remove(vodSavePath)
 		}
 	}
+}
+
+type FfmpegStatusData struct {
+	Data map[string][]byte
+}
+
+func (mm FfmpegStatusData) HandleLogfmt(key, val []byte) error {
+	mm.Data[string(key)] = val
+	return nil
+}
+
+func ffmpegStatus(duration int) {
+	l, err := net.Listen("tcp", ":9998")
+	if err != nil {
+		printFatal(err)
+		return
+	}
+
+	defer l.Close()
+
+	c, err := l.Accept()
+	if err != nil {
+		printFatal(err)
+		return
+	}
+
+	defer c.Close()
+
+	bar := progressbar.NewOptions(duration,
+		progressbar.OptionSetRenderBlankState(!debug),
+		progressbar.OptionSetWriter(os.Stderr),
+	)
+
+	var status FfmpegStatusData
+
+	for {
+		data := make([]byte, 1024)
+
+		_, err := c.Read(data)
+		if err != nil {
+			if err != io.EOF {
+				printFatal(err)
+			} else {
+				ffmpegLogProgress(&status, data, bar)
+			}
+			break
+		}
+
+		status = *ffmpegLogProgress(&status, data, bar)
+	}
+
+	if !debug {
+		bar.Finish()
+		fmt.Println()
+	}
+}
+
+func ffmpegLogProgress(prev *FfmpegStatusData, data []byte, bar *progressbar.ProgressBar) *FfmpegStatusData {
+	curr := &FfmpegStatusData{
+		Data: make(map[string][]byte),
+	}
+	if err := logfmt.Unmarshal(data, curr); err != nil {
+		printFatal(err)
+		return nil
+	}
+
+	v1, _ := strconv.Atoi(string(curr.Data["out_time_us"]))
+	v2, _ := strconv.Atoi(string(prev.Data["out_time_us"]))
+	if !debug {
+		bar.Add((v1 - v2) / 1000000)
+	} else {
+		for k, v := range curr.Data {
+			fmt.Printf("%s=%s\n", k, string(v))
+		}
+	}
+
+	return curr
 }
 
 func deleteChunks(newpath string, chunkCount int, startChunk int, vodID string) {
@@ -501,37 +573,39 @@ func downloadPartVOD(vodIDString string, start string, end string, quality strin
 	}
 	fmt.Printf("Created temp dir: %s\n", newpath)
 
-	fmt.Println("Starting Download")
+	fmt.Println("Downloading")
 
-	for i := startChunk; i < (startChunk + chunkCount); i++ {
-
-		s := strconv.Itoa(i)
-		n := fileUris[i]
-		go downloadChunk(newpath, edgecastBaseURL, s, n, vodIDString, &wg)
+	vodInfo := &VodInfo{
+		Id:      vodIDString,
+		BaseUrl: edgecastBaseURL,
+		Path:    newpath,
 	}
 
-	go func() {
-		doneChunks := 0
+	jobs := make(chan ChunkInfo, chunkCount)
+	status := make(chan int)
 
-		loadingBarLength := 20.0
-		for {
-			doneChunks += <-chunkProgress
+	for w := 1; w <= concurrentDownloads; w++ {
+		go chunkWorker(vodInfo, jobs, status, &wg)
+	}
 
-			progress := float64(doneChunks) / float64(chunkCount)
-			fmt.Printf(
-				"\r[%s%s] %d/%d",
-				strings.Repeat("█", int(progress*loadingBarLength)),
-				strings.Repeat(" ", int(loadingBarLength-progress*loadingBarLength)),
-				doneChunks,
-				chunkCount,
-			)
+	go downloadLogProgress(chunkCount, status)
+
+	for i := startChunk; i < (startChunk + chunkCount); i++ {
+		job := ChunkInfo{
+			Id:  strconv.Itoa(i),
+			Url: fileUris[i],
 		}
-	}()
+
+		jobs <- job
+	}
 
 	wg.Wait()
+	//FIXME: this sends null value to all workers
+	//	close(jobs)
 
 	fmt.Println("\nCombining parts")
 
+	go ffmpegStatus(clipDuration)
 	ffmpegCombine(newpath, chunkCount, startChunk, vodIDString, vodSavePath)
 
 	fmt.Println("Deleting chunks")
@@ -542,7 +616,53 @@ func downloadPartVOD(vodIDString string, start string, end string, quality strin
 
 	os.Remove(newpath)
 
-	fmt.Println("All done!")
+	fmt.Println("Complete")
+}
+
+type VodInfo struct {
+	Path    string
+	BaseUrl string
+	Id      string
+}
+
+type ChunkInfo struct {
+	Id  string
+	Url string
+}
+
+func chunkWorker(vod *VodInfo, chunkJobs <-chan ChunkInfo, status chan<- int, wg *sync.WaitGroup) {
+	for {
+		j := <-chunkJobs
+
+		chunkLength := downloadChunk(vod.Path, vod.BaseUrl, j.Id, j.Url, vod.Id)
+
+		if chunkLength > 0 {
+			status <- 1
+		} else {
+			status <- 0
+		}
+		wg.Done()
+	}
+}
+
+func downloadLogProgress(chunkCount int, status <-chan int) {
+	var downloaded int = 0
+	bar := progressbar.NewOptions(chunkCount-1,
+		progressbar.OptionSetRenderBlankState(!debug),
+		progressbar.OptionShowCount(),
+	)
+
+	for {
+		downloaded += <-status
+
+		if !debug {
+			bar.Add(1)
+
+			if downloaded == chunkCount {
+				bar.Finish()
+			}
+		}
+	}
 }
 
 func calcStartChunkAndChunkCount(chunkDurations []float64, startSeconds int, clipDuration int) (int, int, float64) {
@@ -610,21 +730,6 @@ func readFileDurations(m3u8List string) ([]float64, error) {
 	return ret, nil
 }
 
-func rightVersion() bool {
-	resp, err := http.Get(currentReleaseLink)
-	if err != nil {
-		printFatal(err, "Could not access github while checking for most recent release.")
-	}
-
-	body, _ := ioutil.ReadAll(resp.Body)
-
-	respString := string(body)
-
-	cs := strings.Index(respString, currentReleaseStart) + len(currentReleaseStart)
-	ce := cs + len(versionNumber)
-	return respString[cs:ce] == versionNumber
-}
-
 func ffmpegIsInstalled() bool {
 	out, _ := exec.Command(ffmpegCMD).Output()
 	return out != nil
@@ -639,7 +744,7 @@ func main() {
 	start := flag.String("start", "0 0 0", "For example: 0 0 0 for starting at the beginning of the vod")
 	end := flag.String("end", "full", "For example: 1 20 0 for ending the vod at 1 hour and 20 minutes")
 	quality := flag.String("quality", sourceQuality, "chunked for source quality is automatically used if -quality isn't set")
-	myClientID := flag.String("client-id", twitchClientID, "Use your own client id")
+	//	myClientID := flag.String("client-id", twitchClientID, "Use your own client id")
 	debugFlag := flag.Bool("debug", false, "debug output")
 	semaphoreLimit := flag.Int("max-concurrent-downloads", 5, "change maximum number of concurrent downloads")
 	downloadPath := flag.String("download-path", ".", "path where the file will be saved")
@@ -654,27 +759,13 @@ func main() {
 		filename = vodID
 	}
 
-	if runtime.GOOS == "windows" {
-		ffmpegCMD = `ffmpeg.exe`
-	}
-
 	if !*qualityInfo && !ffmpegIsInstalled() {
 		fmt.Println("Could not find ffmpeg, make sure to have ffmpeg avaliable on your system.")
 		os.Exit(1)
 	}
 
 	debug = *debugFlag
-	sem = semaphore.New(*semaphoreLimit)
-
-	if strings.Compare(*myClientID, twitchClientID) == 0 {
-		fmt.Println("If you encounter errors looking like: \"Couldn't find quality: chunked\" you might have to use your own client-id. \nUse -client-id to pass it to concat. \nFind out how to get your own client id here: https://github.com/ArneVogel/concat/wiki/FAQ#how-to-get-a-client-id\n")
-	}
-	twitchClientID = *myClientID
-	printDebugf("\ntwitchClientID: %s\n", twitchClientID)
-
-	if !rightVersion() {
-		fmt.Printf("\nYou are using an old version of concat. Check out %s for the most recent version.\n\n", currentReleaseLink)
-	}
+	concurrentDownloads = *semaphoreLimit
 
 	if *vodID == standardVOD {
 		wrongInputNotification()
