@@ -41,13 +41,17 @@ const chunkFileExtension string = ".ts"
 var ffmpegCMD = `ffmpeg`
 
 var debug bool
-var twitchClientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+
+//var twitchClientID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+var twitchClientID = "b31o4btkqth5bzbvr9ub2ovr79umhh"
 
 var concurrentDownloads int
 
 var maxTryCount *int
 var audio *bool
 var audioOnly *bool
+
+var m3u8 *string
 
 /*
 	Returns the signature and token from a tokenAPILink
@@ -299,7 +303,6 @@ func ffmpegStatus(duration int) {
 
 	bar := progressbar.NewOptions(duration,
 		progressbar.OptionSetRenderBlankState(!debug),
-		progressbar.OptionSetWriter(os.Stderr),
 	)
 
 	var status FfmpegStatusData
@@ -322,7 +325,6 @@ func ffmpegStatus(duration int) {
 
 	if !debug {
 		bar.Finish()
-		fmt.Println()
 	}
 }
 
@@ -404,34 +406,35 @@ func wrongInputNotification() {
 }
 
 func downloadPartVOD(vodIDString string, start string, end string, quality string, downloadPath string, filename string) {
-	var vodID, vodSH, vodSM, vodSS, vodEH, vodEM, vodES int
+	vodInfo := VodInfo2{
+		Id:      vodIDString,
+		BaseUrl: "",
+		Pls:     "",
+		Path:    "",
+	}
 
-	vodID, _ = strconv.Atoi(vodIDString)
+	if *m3u8 != "" {
+		m3u8List, err := ioutil.ReadFile(*m3u8)
 
-	startArray := strings.Split(start, " ")
-	vodSH, _ = strconv.Atoi(startArray[0]) //start Hour
-	vodSM, _ = strconv.Atoi(startArray[1]) //start minute
-	vodSS, _ = strconv.Atoi(startArray[2]) //start second
-
-	if end != "full" {
-		endArray := strings.Split(end, " ")
-
-		vodEH, _ = strconv.Atoi(endArray[0]) //end hour
-		vodEM, _ = strconv.Atoi(endArray[1]) //end minute
-		vodES, _ = strconv.Atoi(endArray[2]) //end second
-
-		if toSeconds(vodSH, vodSM, vodSS) > toSeconds(vodEH, vodEM, vodES) {
-			wrongInputNotification()
+		if err != nil {
+			printFatal(err, "Could not open playlist")
 		}
+
+		//TODO: arbitrary format not supported yet
+		vodInfo.Pls = string(m3u8List)
+		//vodInfo.BaseUrl
+		return
+	} else {
+		obtainMetadata(&vodInfo, quality)
 	}
 
-	vodSavePath := filepath.Join(downloadPath, filename+".mp4")
+	fetchChunks(vodInfo, start, end, downloadPath, filename)
+}
 
-	_, err := os.Stat(vodSavePath)
+func obtainMetadata(vodInfo *VodInfo2, quality string) *string {
+	var vodID int
 
-	if err == nil || !os.IsNotExist(err) {
-		printFatalf(err, "Destination file %s already exists!\n", vodSavePath)
-	}
+	vodID, _ = strconv.Atoi(vodInfo.Id)
 
 	tokenAPILink := fmt.Sprintf("https://api.twitch.tv/api/vods/%v/access_token?&client_id="+twitchClientID, vodID)
 
@@ -523,13 +526,52 @@ func downloadPartVOD(vodIDString string, start string, end string, quality strin
 	fmt.Println("Getting Video info")
 
 	m3u8List, err := getM3U8List(m3u8Link)
+
 	if err != nil {
 		printFatal(err, "Couldn't download m3u8 list")
 	}
 
+	vodInfo.Pls = m3u8List
+	vodInfo.BaseUrl = edgecastBaseURL
+
+	return &m3u8List
+}
+
+func fetchChunks(vodInfo VodInfo2, start string, end string, downloadPath string, filename string) {
+	var vodSH, vodSM, vodSS, vodEH, vodEM, vodES int
+
+	m3u8List := vodInfo.Pls
+
+	vodSavePath := filepath.Join(downloadPath, filename+".mp4")
+
+	_, err := os.Stat(vodSavePath)
+
+	if err == nil || !os.IsNotExist(err) {
+		printFatalf(err, "Destination file %s already exists!\n", vodSavePath)
+	}
+
+	startArray := strings.Split(start, " ")
+	vodSH, _ = strconv.Atoi(startArray[0]) //start Hour
+	vodSM, _ = strconv.Atoi(startArray[1]) //start minute
+	vodSS, _ = strconv.Atoi(startArray[2]) //start second
+
+	if end != "full" {
+		endArray := strings.Split(end, " ")
+
+		vodEH, _ = strconv.Atoi(endArray[0]) //end hour
+		vodEM, _ = strconv.Atoi(endArray[1]) //end minute
+		vodES, _ = strconv.Atoi(endArray[2]) //end second
+
+		if toSeconds(vodSH, vodSM, vodSS) > toSeconds(vodEH, vodEM, vodES) {
+			wrongInputNotification()
+		}
+	}
+
 	printDebugf("\nm3u8List:\n%s\n", m3u8List)
 
+	//this recently changed to relative uris, which is expected
 	fileUris := readFileUris(m3u8List)
+	//fileUris :=
 
 	printDebugf("\nItems list: %v\n", fileUris)
 
@@ -565,7 +607,9 @@ func downloadPartVOD(vodIDString string, start string, end string, quality strin
 	var wg sync.WaitGroup
 	wg.Add(chunkCount)
 
-	newpath := filepath.Join(downloadPath, "_"+vodIDString)
+	newpath := filepath.Join(downloadPath, "_"+vodInfo.Id)
+
+	vodInfo.Path = newpath
 
 	err = os.MkdirAll(newpath, os.ModePerm)
 	if err != nil {
@@ -574,12 +618,13 @@ func downloadPartVOD(vodIDString string, start string, end string, quality strin
 	fmt.Printf("Created temp dir: %s\n", newpath)
 
 	fmt.Println("Downloading")
-
-	vodInfo := &VodInfo{
-		Id:      vodIDString,
-		BaseUrl: edgecastBaseURL,
-		Path:    newpath,
-	}
+	/*
+		vodInfo := &VodInfo{
+			Id:      vodIDString,
+			BaseUrl: edgecastBaseURL,
+			Path:    newpath,
+		}
+	*/
 
 	jobs := make(chan ChunkInfo, chunkCount)
 	status := make(chan int)
@@ -606,11 +651,11 @@ func downloadPartVOD(vodIDString string, start string, end string, quality strin
 	fmt.Println("\nCombining parts")
 
 	go ffmpegStatus(clipDuration)
-	ffmpegCombine(newpath, chunkCount, startChunk, vodIDString, vodSavePath)
+	ffmpegCombine(newpath, chunkCount, startChunk, vodInfo.Id, vodSavePath)
 
-	fmt.Println("Deleting chunks")
+	fmt.Println("\nDeleting chunks")
 
-	deleteChunks(newpath, chunkCount, startChunk, vodIDString)
+	deleteChunks(newpath, chunkCount, startChunk, vodInfo.Id)
 
 	fmt.Println("Deleting temp dir")
 
@@ -625,12 +670,19 @@ type VodInfo struct {
 	Id      string
 }
 
+type VodInfo2 struct {
+	Path    string
+	BaseUrl string
+	Pls     string
+	Id      string
+}
+
 type ChunkInfo struct {
 	Id  string
 	Url string
 }
 
-func chunkWorker(vod *VodInfo, chunkJobs <-chan ChunkInfo, status chan<- int, wg *sync.WaitGroup) {
+func chunkWorker(vod VodInfo2, chunkJobs <-chan ChunkInfo, status chan<- int, wg *sync.WaitGroup) {
 	for {
 		j := <-chunkJobs
 
@@ -641,26 +693,32 @@ func chunkWorker(vod *VodInfo, chunkJobs <-chan ChunkInfo, status chan<- int, wg
 		} else {
 			status <- 0
 		}
+
 		wg.Done()
 	}
 }
 
 func downloadLogProgress(chunkCount int, status <-chan int) {
 	var downloaded int = 0
-	bar := progressbar.NewOptions(chunkCount-1,
+	bar := progressbar.NewOptions(chunkCount,
 		progressbar.OptionSetRenderBlankState(!debug),
 		progressbar.OptionShowCount(),
+		progressbar.OptionForceRender(),
 	)
+	//FIXME: this is a dirty hack for racing condition between wg and bar render
+	bar.Add(1)
 
 	for {
 		downloaded += <-status
 
 		if !debug {
 			bar.Add(1)
-
-			if downloaded == chunkCount {
-				bar.Finish()
-			}
+			/*
+				if downloaded == chunkCount {
+					bar.Finish()
+					break
+				}
+			*/
 		}
 	}
 }
@@ -752,6 +810,8 @@ func main() {
 	audio = flag.Bool("audio", false, "extract audio from the video file")
 	audioOnly = flag.Bool("audio-only", false, "end up only with a audio file")
 	maxTryCount = flag.Int("try-count", 3, "amount of times concat should try fetching chunks. Set to 0 for infinite retries")
+
+	m3u8 = flag.String("playlist", "", "external stream playlist")
 
 	flag.Parse()
 
