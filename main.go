@@ -94,13 +94,21 @@ func accessUsherAPI(usherAPILink string) (map[string]string, error) {
 
 	printDebugf("\nUsher API response:\n%s\n", respString)
 
-	var re = regexp.MustCompile(qualityStart + "([^\"]+)" + qualityEnd + "\n([^\n]+)\n")
-	match := re.FindAllStringSubmatch(respString, -1)
+	//first element sometimes (fuck you twitch) wouldn't have "FRAME-RATE" setting
+	var re_source = regexp.MustCompile(qualityStart + "([^\"]+)" + qualityEnd + "\n([^\n]+)\n")
+	match_1 := re_source.FindAllStringSubmatch(respString, -1)
+
+	var re = regexp.MustCompile(qualityStart + "([^\"]+)" + qualityEnd + ",FRAME-RATE=([0-9]*[.])?[0-9]+" + "\n([^\n]+)\n")
+	match_2 := re.FindAllStringSubmatch(respString, -1)
 
 	edgecastURLmap := make(map[string]string)
 
-	for _, element := range match {
+	for _, element := range match_1 {
 		edgecastURLmap[element[1]] = element[2]
+	}
+
+	for _, element := range match_2 {
+		edgecastURLmap[element[1]] = element[3]
 	}
 
 	return edgecastURLmap, err
